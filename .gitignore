@@ -1,0 +1,31 @@
+# Binary
+tfmap
+dist/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Frontend (covered by web/.gitignore too)
+web/node_modules/
+web/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Debug
+__debug_bin*

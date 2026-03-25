@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply m-0 bg-gray-950 text-gray-200 font-sans antialiased;
+  }
+
+  #root {
+    @apply h-screen w-screen overflow-hidden;
+  }
+}
