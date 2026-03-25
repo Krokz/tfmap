@@ -24,19 +24,8 @@ jobs:
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
-      - name: Build frontend
-        run: cd web && npm ci && npm run build
-
-      - name: Ensure dist directory
-        run: mkdir -p dist
-
-      - name: Build binaries
-        run: |
-          GOOS=darwin  GOARCH=arm64 go build -o dist/tfmap-darwin-arm64     .
-          GOOS=darwin  GOARCH=amd64 go build -o dist/tfmap-darwin-amd64     .
-          GOOS=linux   GOARCH=amd64 go build -o dist/tfmap-linux-amd64     .
-          GOOS=linux   GOARCH=386   go build -o dist/tfmap-linux-386       .
-          GOOS=windows GOARCH=amd64 go build -o dist/tfmap-windows-amd64.exe .
+      - name: Build all binaries
+        run: make build-all
 
       - name: Create release
         uses: softprops/action-gh-release@v2
