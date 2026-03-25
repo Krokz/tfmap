@@ -149,25 +149,65 @@ type backendChoice struct {
 
 func collectBackends(project *model.Project) []backendChoice {
 	var choices []backendChoice
-	seen := make(map[string]bool)
+	seenPath := make(map[string]bool)
+	seenConfig := make(map[string]bool)
 
 	if project.Backend != nil {
+		bk := backendKey(project.Backend)
 		choices = append(choices, backendChoice{path: ".", backend: project.Backend})
-		seen["."] = true
+		seenPath["."] = true
+		seenConfig[bk] = true
 	}
 
 	for _, dm := range project.DiscoveredModules {
 		if !dm.IsRoot || !dm.HasBackend || dm.Backend == nil {
 			continue
 		}
-		if seen[dm.Path] {
+		if seenPath[dm.Path] {
+			continue
+		}
+		bk := backendKey(dm.Backend)
+		if seenConfig[bk] {
 			continue
 		}
 		choices = append(choices, backendChoice{path: dm.Path, backend: dm.Backend})
-		seen[dm.Path] = true
+		seenPath[dm.Path] = true
+		seenConfig[bk] = true
 	}
 
 	return choices
+}
+
+func backendKey(b *model.Backend) string {
+	switch b.Type {
+	case "s3":
+		bucket, _ := b.Config["bucket"].(string)
+		key, _ := b.Config["key"].(string)
+		region, _ := b.Config["region"].(string)
+		if key == "" {
+			key = "terraform.tfstate"
+		}
+		if region == "" {
+			region = "us-east-1"
+		}
+		return fmt.Sprintf("s3:%s:%s:%s", region, bucket, key)
+	case "azurerm":
+		account, _ := b.Config["storage_account_name"].(string)
+		container, _ := b.Config["container_name"].(string)
+		key, _ := b.Config["key"].(string)
+		if key == "" {
+			key = "terraform.tfstate"
+		}
+		return fmt.Sprintf("azurerm:%s:%s:%s", account, container, key)
+	case "gcs":
+		bucket, _ := b.Config["bucket"].(string)
+		prefix, _ := b.Config["prefix"].(string)
+		return fmt.Sprintf("gcs:%s:%s", bucket, prefix)
+	case "local", "":
+		return "local"
+	default:
+		return b.Type
+	}
 }
 
 func backendSummary(b *model.Backend) string {
@@ -183,6 +223,21 @@ func backendSummary(b *model.Backend) string {
 			region = "us-east-1"
 		}
 		return fmt.Sprintf("s3://%s/%s (%s)", bucket, key, region)
+	case "azurerm":
+		account, _ := b.Config["storage_account_name"].(string)
+		container, _ := b.Config["container_name"].(string)
+		key, _ := b.Config["key"].(string)
+		if key == "" {
+			key = "terraform.tfstate"
+		}
+		return fmt.Sprintf("azurerm://%s/%s/%s", account, container, key)
+	case "gcs":
+		bucket, _ := b.Config["bucket"].(string)
+		prefix, _ := b.Config["prefix"].(string)
+		if prefix == "" {
+			return fmt.Sprintf("gs://%s/default.tfstate", bucket)
+		}
+		return fmt.Sprintf("gs://%s/%s/default.tfstate", bucket, prefix)
 	case "local", "":
 		return "local"
 	default:
@@ -202,8 +257,13 @@ func selectBackends(project *model.Project, globalProfile string) (map[string]bo
 		b := backends[0]
 		label := pathLabel(b.path)
 		fmt.Printf("\nDetected backend: %s — %s\n", label, backendSummary(b.backend))
-		if b.backend.Type == "s3" {
+		switch b.backend.Type {
+		case "s3":
 			profileMap[b.path] = promptS3Profile(globalProfile, label)
+		case "azurerm":
+			checkAzureCLI()
+		case "gcs":
+			checkGCloudCLI()
 		}
 		return map[string]bool{b.path: true}, profileMap
 	}
@@ -288,6 +348,40 @@ func selectBackends(project *model.Project, globalProfile string) (map[string]bo
 		}
 	}
 
+	var azureBackends []backendChoice
+	for _, b := range backends {
+		if selected[b.path] && b.backend.Type == "azurerm" {
+			azureBackends = append(azureBackends, b)
+		}
+	}
+	if len(azureBackends) > 0 {
+		if !promptYesNo("\nWould you like to connect to the remote Azure state backends?", true) {
+			fmt.Println("Skipping Azure state reading.")
+			for _, b := range azureBackends {
+				delete(selected, b.path)
+			}
+		} else {
+			checkAzureCLI()
+		}
+	}
+
+	var gcsBackends []backendChoice
+	for _, b := range backends {
+		if selected[b.path] && b.backend.Type == "gcs" {
+			gcsBackends = append(gcsBackends, b)
+		}
+	}
+	if len(gcsBackends) > 0 {
+		if !promptYesNo("\nWould you like to connect to the remote GCS state backends?", true) {
+			fmt.Println("Skipping GCS state reading.")
+			for _, b := range gcsBackends {
+				delete(selected, b.path)
+			}
+		} else {
+			checkGCloudCLI()
+		}
+	}
+
 	selectedNames := make([]string, 0, len(selected))
 	for _, b := range backends {
 		if selected[b.path] {
@@ -362,6 +456,30 @@ func loadState(project *model.Project, stateReader *state.Reader, absPath string
 		}
 	}
 
+	// Propagate loaded state to modules whose backend config matches an
+	// already-loaded state (covers paths removed by backend deduplication).
+	configToSnap := make(map[string]*model.StateSnapshot)
+	if project.State != nil && project.Backend != nil {
+		configToSnap[backendKey(project.Backend)] = project.State
+	}
+	for _, dm := range project.DiscoveredModules {
+		if dm.Backend != nil && project.ModuleStates[dm.Path] != nil {
+			configToSnap[backendKey(dm.Backend)] = project.ModuleStates[dm.Path]
+		}
+	}
+	for i, dm := range project.DiscoveredModules {
+		if !dm.IsRoot || !dm.HasBackend || dm.Backend == nil || dm.Path == "." {
+			continue
+		}
+		if project.ModuleStates[dm.Path] != nil {
+			continue
+		}
+		if snap, ok := configToSnap[backendKey(dm.Backend)]; ok {
+			project.ModuleStates[dm.Path] = snap
+			project.DiscoveredModules[i].Backend.Accessible = true
+		}
+	}
+
 	state.CompareWithState(project)
 }
 
@@ -375,6 +493,26 @@ func checkAWSCLI() {
 			version = version[:idx]
 		}
 		fmt.Printf("  AWS CLI found: %s\n", version)
+	}
+}
+
+func checkAzureCLI() {
+	out, err := exec.Command("az", "--version").Output()
+	if err != nil {
+		fmt.Println("  Azure CLI not found. Will attempt using default Azure credential chain (env vars, managed identity, etc.)")
+	} else {
+		lines := strings.SplitN(string(out), "\n", 2)
+		fmt.Printf("  Azure CLI found: %s\n", strings.TrimSpace(lines[0]))
+	}
+}
+
+func checkGCloudCLI() {
+	out, err := exec.Command("gcloud", "--version").Output()
+	if err != nil {
+		fmt.Println("  gcloud CLI not found. Will attempt using Application Default Credentials (env vars, metadata server, etc.)")
+	} else {
+		lines := strings.SplitN(string(out), "\n", 2)
+		fmt.Printf("  gcloud CLI found: %s\n", strings.TrimSpace(lines[0]))
 	}
 }
 

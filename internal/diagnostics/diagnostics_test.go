@@ -445,6 +445,201 @@ func TestCycleEdgesCorrectlyReconstructed(t *testing.T) {
 	}
 }
 
+func TestCrossDirectoryNoCycle(t *testing.T) {
+	p := baseProject()
+	// Same resource name in two different module directories should NOT create a cycle
+	p.Resources = []model.Resource{
+		{Type: "aws_instance", Name: "web", Attributes: map[string]interface{}{},
+			References: []string{"aws_security_group.main"},
+			Source:     model.SourceLocation{File: "modules/a/main.tf", Line: 1}},
+		{Type: "aws_security_group", Name: "main", Attributes: map[string]interface{}{},
+			Source: model.SourceLocation{File: "modules/a/main.tf", Line: 10}},
+		{Type: "aws_instance", Name: "web", Attributes: map[string]interface{}{},
+			References: []string{"aws_security_group.main"},
+			Source:     model.SourceLocation{File: "modules/b/main.tf", Line: 1}},
+		{Type: "aws_security_group", Name: "main", Attributes: map[string]interface{}{},
+			References: []string{"aws_instance.web"},
+			Source:     model.SourceLocation{File: "modules/b/main.tf", Line: 10}},
+	}
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 1 {
+		t.Fatalf("expected 1 cycle (only in modules/b), got %d", len(cycles))
+	}
+	if !strings.Contains(cycles[0].Detail, "modules/b/main.tf") {
+		t.Errorf("cycle should be in modules/b, got detail: %s", cycles[0].Detail)
+	}
+}
+
+func TestModuleSelfRefRegistrySuppressed(t *testing.T) {
+	p := baseProject()
+	// Registry module self-referencing its own output — should be suppressed
+	p.Modules = []model.ModuleCall{
+		{Name: "vpc", Source: "terraform-aws-modules/vpc/aws",
+			Inputs:     map[string]interface{}{"public_subnets": "module.vpc.azs"},
+			References: []string{"module.vpc.azs"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 1}},
+	}
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 0 {
+		t.Errorf("expected 0 cycles for registry module self-ref, got %d", len(cycles))
+	}
+}
+
+func TestModuleSelfRefLocalFalsePositive(t *testing.T) {
+	p := baseProject()
+	// Local module self-referencing its own output, but the output does NOT
+	// depend on the variable that creates the self-reference → false positive
+	p.Modules = []model.ModuleCall{
+		{Name: "iam", Source: "../../modules/iam",
+			Inputs:     map[string]interface{}{"ssm_key_arn": "module.iam.key_ssm"},
+			References: []string{"module.iam.key_ssm"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 1}},
+	}
+	// The child module: output.key_ssm depends on aws_ssm.key, which depends
+	// on var.region (NOT var.ssm_key_arn)
+	p.Resources = []model.Resource{
+		{Type: "aws_ssm_parameter", Name: "key", Attributes: map[string]interface{}{},
+			References: []string{"var.region"},
+			Source:     model.SourceLocation{File: "modules/iam/main.tf", Line: 1}},
+	}
+	p.Outputs = []model.Output{
+		{Name: "key_ssm",
+			References: []string{"aws_ssm_parameter.key.arn"},
+			Source:     model.SourceLocation{File: "modules/iam/outputs.tf", Line: 1}},
+	}
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 0 {
+		t.Errorf("expected 0 cycles for local module self-ref false positive, got %d", len(cycles))
+	}
+}
+
+func TestModuleSelfRefLocalRealCycle(t *testing.T) {
+	p := baseProject()
+	// Local module self-referencing its own output, where the output DOES
+	// depend on the cycling variable → real cycle
+	p.Modules = []model.ModuleCall{
+		{Name: "loop", Source: "../../modules/loop",
+			Inputs:     map[string]interface{}{"input_a": "module.loop.output_b"},
+			References: []string{"module.loop.output_b"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 1}},
+	}
+	// The child module: output.output_b → null_resource.bar → var.input_a (cycle!)
+	p.Resources = []model.Resource{
+		{Type: "null_resource", Name: "bar", Attributes: map[string]interface{}{},
+			References: []string{"var.input_a"},
+			Source:     model.SourceLocation{File: "modules/loop/main.tf", Line: 1}},
+	}
+	p.Outputs = []model.Output{
+		{Name: "output_b",
+			References: []string{"null_resource.bar.id"},
+			Source:     model.SourceLocation{File: "modules/loop/outputs.tf", Line: 1}},
+	}
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 1 {
+		t.Errorf("expected 1 cycle for real self-referencing module, got %d", len(cycles))
+	}
+}
+
+func TestInterModuleCycleFalsePositive(t *testing.T) {
+	p := baseProject()
+	// module.alb needs module.route53.cert_arn, and module.route53 needs
+	// module.alb.dns_name. But internally, alb's dns_name does NOT depend
+	// on var.cert_arn, so the cycle is a false positive.
+	p.Modules = []model.ModuleCall{
+		{Name: "alb", Source: "../../modules/alb",
+			Inputs:     map[string]interface{}{"cert_arn": "module.route53.cert_arn"},
+			References: []string{"module.route53.cert_arn"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 1}},
+		{Name: "route53", Source: "../../modules/route53",
+			Inputs:     map[string]interface{}{"alb_dns": "module.alb.dns_name"},
+			References: []string{"module.alb.dns_name"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 20}},
+	}
+	// modules/alb: dns_name output depends on aws_alb (NOT var.cert_arn)
+	p.Resources = append(p.Resources,
+		model.Resource{Type: "aws_alb", Name: "main", Attributes: map[string]interface{}{},
+			References: []string{"var.vpc_id"},
+			Source:     model.SourceLocation{File: "modules/alb/main.tf", Line: 1}},
+		model.Resource{Type: "aws_alb_listener", Name: "https", Attributes: map[string]interface{}{},
+			References: []string{"aws_alb.main", "var.cert_arn"},
+			Source:     model.SourceLocation{File: "modules/alb/main.tf", Line: 10}},
+	)
+	p.Outputs = append(p.Outputs,
+		model.Output{Name: "dns_name",
+			References: []string{"aws_alb.main.dns_name"},
+			Source:     model.SourceLocation{File: "modules/alb/outputs.tf", Line: 1}},
+	)
+	// modules/route53: cert_arn output depends on aws_acm (NOT var.alb_dns)
+	p.Resources = append(p.Resources,
+		model.Resource{Type: "aws_acm_certificate", Name: "cert", Attributes: map[string]interface{}{},
+			References: []string{"var.domain"},
+			Source:     model.SourceLocation{File: "modules/route53/main.tf", Line: 1}},
+		model.Resource{Type: "aws_route53_record", Name: "main", Attributes: map[string]interface{}{},
+			References: []string{"var.alb_dns"},
+			Source:     model.SourceLocation{File: "modules/route53/main.tf", Line: 10}},
+	)
+	p.Outputs = append(p.Outputs,
+		model.Output{Name: "cert_arn",
+			References: []string{"aws_acm_certificate.cert.arn"},
+			Source:     model.SourceLocation{File: "modules/route53/outputs.tf", Line: 1}},
+	)
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 0 {
+		t.Errorf("expected 0 cycles for inter-module false positive, got %d", len(cycles))
+		for _, c := range cycles {
+			t.Logf("  cycle: %s", c.Detail)
+		}
+	}
+}
+
+func TestInterModuleCycleReal(t *testing.T) {
+	p := baseProject()
+	// module.a needs module.b.out_b, module.b needs module.a.out_a.
+	// Inside each module, the referenced output DOES depend on the cycling var.
+	p.Modules = []model.ModuleCall{
+		{Name: "a", Source: "../../modules/a",
+			Inputs:     map[string]interface{}{"from_b": "module.b.out_b"},
+			References: []string{"module.b.out_b"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 1}},
+		{Name: "b", Source: "../../modules/b",
+			Inputs:     map[string]interface{}{"from_a": "module.a.out_a"},
+			References: []string{"module.a.out_a"},
+			Location:   model.SourceLocation{File: "envs/prod/main.tf", Line: 10}},
+	}
+	// modules/a: out_a depends on var.from_b (cycle!)
+	p.Resources = append(p.Resources,
+		model.Resource{Type: "null_resource", Name: "a_res", Attributes: map[string]interface{}{},
+			References: []string{"var.from_b"},
+			Source:     model.SourceLocation{File: "modules/a/main.tf", Line: 1}},
+	)
+	p.Outputs = append(p.Outputs,
+		model.Output{Name: "out_a",
+			References: []string{"null_resource.a_res.id"},
+			Source:     model.SourceLocation{File: "modules/a/outputs.tf", Line: 1}},
+	)
+	// modules/b: out_b depends on var.from_a (cycle!)
+	p.Resources = append(p.Resources,
+		model.Resource{Type: "null_resource", Name: "b_res", Attributes: map[string]interface{}{},
+			References: []string{"var.from_a"},
+			Source:     model.SourceLocation{File: "modules/b/main.tf", Line: 1}},
+	)
+	p.Outputs = append(p.Outputs,
+		model.Output{Name: "out_b",
+			References: []string{"null_resource.b_res.id"},
+			Source:     model.SourceLocation{File: "modules/b/outputs.tf", Line: 1}},
+	)
+	diags := Analyze(p)
+	cycles := filterByRule(diags, "dependency-cycle")
+	if len(cycles) != 1 {
+		t.Fatalf("expected 1 cycle for real inter-module cycle, got %d", len(cycles))
+	}
+}
+
 func TestStripHCLComment(t *testing.T) {
 	tests := []struct {
 		input, want string

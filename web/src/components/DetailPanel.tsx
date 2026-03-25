@@ -632,14 +632,16 @@ function CycleInfoSection({
 
 export function DetailPanel({ project, fullProject, selected, onClose, onNavigateToModule, cycleHighlights }: Props) {
   const item = useMemo(
-    () => findItem(project, selected),
-    [project, selected]
+    () => findItem(project, selected) ?? findItem(fullProject, selected),
+    [project, fullProject, selected]
   );
 
   const moduleCall = useMemo(() => {
     if (selected.kind !== "module") return null;
-    return project.modules.find((m) => m.name === selected.id) ?? null;
-  }, [project, selected]);
+    return project.modules.find((m) => m.name === selected.id)
+      ?? fullProject.modules.find((m) => m.name === selected.id)
+      ?? null;
+  }, [project, fullProject, selected]);
 
   const cycleEdgesForItem = useMemo(() => {
     if (!item || cycleHighlights.size === 0 || !cycleHighlights.has(item.label)) return null;

@@ -8,7 +8,7 @@ A local-first Terraform visualization tool. Point it at any Terraform directory 
 
 - **Dependency graph** — interactive React Flow graph of resources, data sources, and modules with auto-layout. Expand any module node inline to reveal its child resources, data sources, and sub-modules without leaving the current view
 - **Diagnostics engine** — detects dependency cycles, unused variables, missing tags, missing descriptions, provider version pins, sensitive naming, high blast-radius resources, and orphaned state entries
-- **State drift detection** — reads remote state (S3 backends) and compares with HCL, flagging resources as in-sync, drifted, not-in-state, or orphaned. Modules show an aggregate indicator: green (all children in sync), light yellow (partially drifted), or orange (all children drifted)
+- **State drift detection** — reads remote state (S3, Azure Blob Storage, and GCS backends) and compares with HCL, flagging resources as in-sync, drifted, not-in-state, or orphaned. Modules show an aggregate indicator: green (all children in sync), light yellow (partially drifted), or orange (all children drifted)
 - **Multi-module navigation** — discover and jump into nested modules; see which internal resources participate in cross-module cycles
 - **Live reload** — watches the filesystem for `.tf` changes and pushes updates over WebSocket
 
@@ -22,6 +22,8 @@ A local-first Terraform visualization tool. Point it at any Terraform directory 
 | Node.js | 20+ (see `web/.nvmrc`) |
 | npm | 10+ |
 | AWS CLI | optional, for S3 state reading |
+| Azure CLI | optional, for Azure Blob state reading |
+| gcloud CLI | optional, for GCS state reading |
 
 ### Build and run
 
@@ -80,6 +82,8 @@ make build-windows-amd64
 | `--no-state` | | `false` | Skip state reading entirely |
 | `--aws-profile` | | | AWS profile for S3 state reading |
 
+**Supported state backends:** local, S3, Azure Blob Storage (`azurerm`), Google Cloud Storage (`gcs`). Azure uses `DefaultAzureCredential` (run `az login`), GCS uses Application Default Credentials (run `gcloud auth application-default login`).
+
 ### Examples
 
 ```bash
@@ -91,6 +95,14 @@ tfmap --no-state ./modules/networking
 
 # Use a named AWS profile for S3 state
 tfmap --aws-profile production ./envs/prod
+
+# Azure backend — authenticate with az login first
+az login
+tfmap ./envs/prod
+
+# GCS backend — authenticate with gcloud first
+gcloud auth application-default login
+tfmap ./envs/prod
 ```
 
 ## Development
@@ -105,7 +117,7 @@ tfmap/
 │   ├── model/                    # Shared data model (Project, Resource, etc.)
 │   ├── parser/                   # HCL parser (hclsyntax AST)
 │   ├── server/                   # HTTP + WebSocket server
-│   ├── state/                    # Terraform state reader (S3, local)
+│   ├── state/                    # Terraform state reader (local, S3, Azure, GCS)
 │   └── watcher/                  # Filesystem watcher (fsnotify)
 ├── web/                          # React SPA (Vite + TypeScript + Tailwind)
 │   └── src/
@@ -166,9 +178,9 @@ cd web && npm run lint
 │  .tf files  │────▶│  Parser  │────▶│   Project   │
 └─────────────┘     └──────────┘     │   (model)   │
                                      └──────┬──────┘
-┌─────────────┐                             │
-│  State (S3) │──────────────────────▶ CompareWithState
-└─────────────┘                             │
+┌─────────────────────┐                      │
+│ State (S3/Azure/GCS)│─────────────▶ CompareWithState
+└─────────────────────┘                      │
                                      ┌──────▼──────┐
                                      │ Diagnostics │
                                      └──────┬──────┘

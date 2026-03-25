@@ -138,6 +138,7 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
   // Expanded modules: add child entities from fullProject
   const expandedTargetPaths: string[] = [];
   const discovered = fullProject.discoveredModules ?? [];
+  const expansionEdges: Edge[] = [];
 
   for (const m of project.modules) {
     const dir = nodeDirFromFile(m.source.file);
@@ -147,6 +148,15 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
     const targetPath = resolveModuleCallToPath(m, discovered);
     if (!targetPath) continue;
     expandedTargetPaths.push(targetPath);
+
+    const addExpansionChild = (childId: string) => {
+      expansionEdges.push({
+        id: `expand:${moduleId}->${childId}`,
+        source: moduleId,
+        target: childId,
+        data: { isExpansion: true },
+      });
+    };
 
     for (const r of fullProject.resources) {
       const rDir = nodeDirFromFile(r.source.file);
@@ -168,6 +178,7 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
         });
         nodeDirMap.set(childId, rDir);
       }
+      addExpansionChild(childId);
     }
 
     for (const d of fullProject.dataSources) {
@@ -189,6 +200,7 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
         });
         nodeDirMap.set(childId, dDir);
       }
+      addExpansionChild(childId);
     }
 
     for (const cm of fullProject.modules) {
@@ -212,6 +224,7 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
         });
         nodeDirMap.set(childId, cmDir);
       }
+      addExpansionChild(childId);
     }
   }
 
@@ -277,6 +290,14 @@ function buildGraph({ project, fullProject, moduleStateMap, expandedModules }: B
           edges.push({ id: edgeId, source: sourceId, target: targetId });
         }
       }
+    }
+  }
+
+  // Add expansion edges (parent module → expanded children) for layout grouping
+  for (const ee of expansionEdges) {
+    if (visibleIds.has(ee.source) && visibleIds.has(ee.target) && !edgeIds.has(ee.id)) {
+      edgeIds.add(ee.id);
+      edges.push(ee);
     }
   }
 
@@ -367,19 +388,26 @@ const TerraformNodeComponent = memo(function TerraformNodeComponent({
 }: NodeProps<TerraformNode>) {
   const style = KIND_STYLES[data.nodeKind];
   const isCycle = data.inCycle;
-  const hasTag = data.originDir || data.expandedFrom;
+  const isExpanded = data.isExpanded;
+  const hasTag = data.originDir || data.expandedFrom || isExpanded;
   return (
     <div
       className={`rounded-lg border-l-4 ${
-        isCycle ? "border-l-red-500" : style.border
+        isCycle
+          ? "border-l-red-500"
+          : isExpanded
+            ? "border-l-purple-500"
+            : style.border
       } bg-gray-800/90 px-3 min-w-[180px] max-w-[280px] shadow-lg ${
         hasTag ? "pt-1 pb-2" : "py-2.5"
       } ${
         isCycle
           ? "ring-2 ring-red-500/60 shadow-red-500/30 shadow-xl"
-          : selected
-            ? "ring-2 ring-indigo-400/70 shadow-indigo-500/20 shadow-xl"
-            : "ring-1 ring-gray-700/50"
+          : isExpanded
+            ? "ring-2 ring-purple-500/40 shadow-purple-500/20 shadow-xl"
+            : selected
+              ? "ring-2 ring-indigo-400/70 shadow-indigo-500/20 shadow-xl"
+              : "ring-1 ring-gray-700/50"
       }`}
     >
       <Handle
@@ -392,7 +420,12 @@ const TerraformNodeComponent = memo(function TerraformNodeComponent({
           ↳ {data.expandedFrom}
         </div>
       )}
-      {!data.expandedFrom && data.originDir && (
+      {isExpanded && (
+        <div className="text-[8px] font-mono text-purple-400/60 truncate mb-0.5">
+          expanded
+        </div>
+      )}
+      {!data.expandedFrom && !isExpanded && data.originDir && (
         <div className="text-[8px] font-mono text-gray-500 truncate mb-0.5">
           {data.originDir}
         </div>
@@ -417,11 +450,15 @@ const TerraformNodeComponent = memo(function TerraformNodeComponent({
         {data.isExpandable && (
           <button
             data-action="expand"
-            className="w-4 h-4 flex items-center justify-center rounded hover:bg-gray-600/50 text-gray-400 hover:text-gray-200 transition-colors shrink-0"
-            title={data.isExpanded ? "Collapse module" : "Expand module resources"}
+            className={`w-5 h-5 flex items-center justify-center rounded transition-colors shrink-0 ${
+              isExpanded
+                ? "bg-purple-500/25 text-purple-300 hover:bg-purple-500/40"
+                : "bg-gray-700/50 text-gray-400 hover:bg-gray-600/50 hover:text-gray-200"
+            }`}
+            title={isExpanded ? "Collapse module" : "Expand module resources"}
           >
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              {data.isExpanded ? (
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              {isExpanded ? (
                 <path d="M5 12h14" />
               ) : (
                 <path d="M12 5v14M5 12h14" />
@@ -470,6 +507,12 @@ function getActiveNodeIds(
 const DIM_STYLE = { stroke: "#374151", strokeWidth: 1, opacity: 0.15 };
 const NORMAL_STYLE = { stroke: "#4b5563", strokeWidth: 1, opacity: 0.35 };
 const ACTIVE_STYLE = { stroke: "#818cf8", strokeWidth: 2, opacity: 1 };
+const EXPANSION_STYLE = { stroke: "#a78bfa", strokeWidth: 1, opacity: 0.35, strokeDasharray: "4 3" };
+const EXPANSION_ACTIVE_STYLE = { stroke: "#a78bfa", strokeWidth: 1.5, opacity: 0.7, strokeDasharray: "4 3" };
+
+function isExpansionEdge(e: Edge): boolean {
+  return !!(e.data as { isExpansion?: boolean })?.isExpansion;
+}
 
 function computeVisibleEdges(
   allEdges: Edge[],
@@ -477,7 +520,12 @@ function computeVisibleEdges(
   mode: EdgeMode,
   activeNodeIds: Set<string>
 ): Edge[] {
-  if (mode === "off") return [];
+  if (mode === "off") {
+    // Still show expansion edges when edges are off — they show structure
+    return allEdges
+      .filter(isExpansionEdge)
+      .map((e) => ({ ...e, type: "default", style: EXPANSION_STYLE }));
+  }
 
   const edges = allEdges.map((e) => {
     const srcPos = nodePositions.get(e.source);
@@ -493,15 +541,28 @@ function computeVisibleEdges(
   });
 
   if (mode === "selected") {
-    if (activeNodeIds.size === 0) return [];
-    return edges
-      .filter((e) => activeNodeIds.has(e.source) || activeNodeIds.has(e.target))
-      .map((e) => ({ ...e, style: ACTIVE_STYLE, animated: true }));
+    if (activeNodeIds.size === 0) {
+      return edges
+        .filter(isExpansionEdge)
+        .map((e) => ({ ...e, style: EXPANSION_STYLE }));
+    }
+    const filtered = edges.filter(
+      (e) => activeNodeIds.has(e.source) || activeNodeIds.has(e.target)
+    );
+    return filtered.map((e) =>
+      isExpansionEdge(e)
+        ? { ...e, style: EXPANSION_ACTIVE_STYLE }
+        : { ...e, style: ACTIVE_STYLE, animated: true }
+    );
   }
 
   // mode === "all"
   if (activeNodeIds.size > 0) {
     return edges.map((e) => {
+      if (isExpansionEdge(e)) {
+        const connected = activeNodeIds.has(e.source) || activeNodeIds.has(e.target);
+        return { ...e, style: connected ? EXPANSION_ACTIVE_STYLE : EXPANSION_STYLE };
+      }
       const connected = activeNodeIds.has(e.source) || activeNodeIds.has(e.target);
       return {
         ...e,
@@ -512,7 +573,11 @@ function computeVisibleEdges(
     });
   }
 
-  return edges.map((e) => ({ ...e, style: NORMAL_STYLE }));
+  return edges.map((e) =>
+    isExpansionEdge(e)
+      ? { ...e, style: EXPANSION_STYLE }
+      : { ...e, style: NORMAL_STYLE }
+  );
 }
 
 const EDGE_MODE_LABELS: Record<EdgeMode, string> = {

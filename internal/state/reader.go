@@ -22,6 +22,10 @@ func (r *Reader) Read(backend *model.Backend, projectPath string, profile string
 		return r.ReadLocal(projectPath)
 	case "s3":
 		return r.ReadS3(backend, profile)
+	case "azurerm":
+		return r.ReadAzure(backend)
+	case "gcs":
+		return r.ReadGCS(backend)
 	default:
 		return nil, nil
 	}
@@ -71,9 +75,10 @@ func CompareWithState(project *model.Project) {
 			if sr.Mode != "managed" {
 				continue
 			}
+			moduleField := stripModuleIndices(sr.Module)
 			prefix := ""
-			if sr.Module != "" {
-				prefix = sr.Module + "."
+			if moduleField != "" {
+				prefix = moduleField + "."
 			}
 			key := prefix + sr.Type + "." + sr.Name
 			m[key] = &stateEntry{resource: &snap.Resources[i]}
@@ -126,28 +131,40 @@ func CompareWithState(project *model.Project) {
 		}
 	}
 
+	externalModules := map[string]bool{}
+	for _, mc := range project.Modules {
+		if mc.Source != "" && !strings.HasPrefix(mc.Source, "./") && !strings.HasPrefix(mc.Source, "../") {
+			externalModules["module."+mc.Name] = true
+		}
+	}
+
 	var orphans []model.OrphanedResource
 	for rootPath, entries := range stateMaps {
 		for _, entry := range entries {
-			if !entry.matched {
-				sr := entry.resource
-				attrs := map[string]interface{}{}
-				if len(sr.Instances) > 0 {
-					attrs = sr.Instances[0].Attributes
-				}
-				rm := rootPath
-				if rm == "." {
-					rm = ""
-				}
-				orphans = append(orphans, model.OrphanedResource{
-					RootModule: rm,
-					Module:     sr.Module,
-					Type:       sr.Type,
-					Name:       sr.Name,
-					Provider:   sr.Provider,
-					Attributes: attrs,
-				})
+			if entry.matched {
+				continue
 			}
+			sr := entry.resource
+			topModule := topLevelModule(sr.Module)
+			if topModule != "" && externalModules[topModule] {
+				continue
+			}
+			attrs := map[string]interface{}{}
+			if len(sr.Instances) > 0 {
+				attrs = sr.Instances[0].Attributes
+			}
+			rm := rootPath
+			if rm == "." {
+				rm = ""
+			}
+			orphans = append(orphans, model.OrphanedResource{
+				RootModule: rm,
+				Module:     sr.Module,
+				Type:       sr.Type,
+				Name:       sr.Name,
+				Provider:   sr.Provider,
+				Attributes: attrs,
+			})
 		}
 	}
 	project.OrphanedResources = orphans
@@ -237,14 +254,57 @@ func lookupDirMappings(dir string, mappings map[string][]dirMapping) []dirMappin
 	return best
 }
 
+// stripModuleIndices removes count/for_each index keys from state module paths.
+// e.g. "module.foo[0].module.bar[\"key\"]" -> "module.foo.module.bar"
+func stripModuleIndices(module string) string {
+	if !strings.Contains(module, "[") {
+		return module
+	}
+	var b strings.Builder
+	for i := 0; i < len(module); i++ {
+		if module[i] == '[' {
+			for i < len(module) && module[i] != ']' {
+				i++
+			}
+		} else {
+			b.WriteByte(module[i])
+		}
+	}
+	return b.String()
+}
+
+// topLevelModule extracts the top-level "module.NAME" from a state module path.
+// e.g. "module.vpc.module.sub" -> "module.vpc", "module.vpc[0]" -> "module.vpc"
+func topLevelModule(module string) string {
+	if module == "" {
+		return ""
+	}
+	stripped := stripModuleIndices(module)
+	parts := strings.SplitN(stripped, ".", 3)
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return stripped
+}
+
 func isLiteralValue(val interface{}) bool {
-	switch val.(type) {
+	switch v := val.(type) {
 	case string:
-		s := val.(string)
-		if strings.Contains(s, "${") || strings.HasPrefix(s, "var.") ||
-			strings.HasPrefix(s, "module.") || strings.HasPrefix(s, "local.") ||
-			strings.HasPrefix(s, "data.") || strings.HasPrefix(s, "each.") {
+		if strings.ContainsAny(v, "(){}[]") {
 			return false
+		}
+		if strings.Contains(v, "${") || strings.Contains(v, "\n") {
+			return false
+		}
+		exprPrefixes := []string{
+			"var.", "module.", "local.", "data.", "each.",
+			"self.", "terraform.",
+			"aws_", "azurerm_", "google_", "null_", "random_", "tls_", "time_",
+		}
+		for _, p := range exprPrefixes {
+			if strings.HasPrefix(v, p) {
+				return false
+			}
 		}
 		return true
 	case float64, bool, json.Number:

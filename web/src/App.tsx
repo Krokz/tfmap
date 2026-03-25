@@ -251,6 +251,27 @@ export default function App() {
     return map;
   }, [project]);
 
+  const stateResources = useMemo(() => {
+    if (!project || !activeModule) return filteredProject?.resources ?? [];
+    const rootDir = activeModule === "." ? "." : activeModule;
+    const reachableDirs = new Set<string>([rootDir]);
+    const discovered = project.discoveredModules ?? [];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const m of project.modules) {
+        const callerDir = getModulePath(m.source.file);
+        if (!reachableDirs.has(callerDir)) continue;
+        const targetPath = resolveModuleCallToPath(m, discovered);
+        if (targetPath && !reachableDirs.has(targetPath)) {
+          reachableDirs.add(targetPath);
+          changed = true;
+        }
+      }
+    }
+    return project.resources.filter((r) => reachableDirs.has(getModulePath(r.source.file)));
+  }, [project, activeModule, filteredProject]);
+
   const activeOrphans = useMemo<OrphanedResource[]>(() => {
     if (!project?.orphanedResources) return [];
     const rootKey = !activeModule || activeModule === "." ? "" : activeModule;
@@ -351,7 +372,7 @@ export default function App() {
         <StatePanel
           state={activeState}
           backend={activeBackend}
-          resources={filteredProject.resources}
+          resources={stateResources}
           orphanedResources={activeOrphans}
           onClose={() => setStateOpen(false)}
         />

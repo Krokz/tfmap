@@ -147,6 +147,53 @@ func TestReadDispatchS3(t *testing.T) {
 	}
 }
 
+func TestReadDispatchAzure(t *testing.T) {
+	r := NewReader()
+	backend := &model.Backend{
+		Type:   "azurerm",
+		Config: map[string]interface{}{},
+	}
+	snap, err := r.Read(backend, "", "")
+	if snap != nil {
+		t.Error("expected nil snapshot for Azure without storage_account_name config")
+	}
+	if err == nil {
+		t.Error("expected error for Azure without storage_account_name config")
+	}
+}
+
+func TestReadDispatchAzureMissingContainer(t *testing.T) {
+	r := NewReader()
+	backend := &model.Backend{
+		Type: "azurerm",
+		Config: map[string]interface{}{
+			"storage_account_name": "myaccount",
+		},
+	}
+	snap, err := r.Read(backend, "", "")
+	if snap != nil {
+		t.Error("expected nil snapshot for Azure without container_name config")
+	}
+	if err == nil {
+		t.Error("expected error for Azure without container_name config")
+	}
+}
+
+func TestReadDispatchGCS(t *testing.T) {
+	r := NewReader()
+	backend := &model.Backend{
+		Type:   "gcs",
+		Config: map[string]interface{}{},
+	}
+	snap, err := r.Read(backend, "", "")
+	if snap != nil {
+		t.Error("expected nil snapshot for GCS without bucket config")
+	}
+	if err == nil {
+		t.Error("expected error for GCS without bucket config")
+	}
+}
+
 func TestReadDispatchUnknown(t *testing.T) {
 	r := NewReader()
 	backend := &model.Backend{Type: "consul"}
@@ -448,5 +495,219 @@ func TestCompareWithStateSharedModule(t *testing.T) {
 	}
 	if len(project.OrphanedResources) != 0 {
 		t.Errorf("OrphanedResources count = %d, want 0", len(project.OrphanedResources))
+	}
+}
+
+func TestStripModuleIndices(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"", ""},
+		{"module.vpc", "module.vpc"},
+		{"module.foo[0]", "module.foo"},
+		{`module.foo["key"]`, "module.foo"},
+		{"module.foo[0].module.bar", "module.foo.module.bar"},
+		{`module.foo["k1"].module.bar["k2"]`, "module.foo.module.bar"},
+		{`module.svc[0].module.inner["x"].module.deep[1]`, "module.svc.module.inner.module.deep"},
+	}
+	for _, tt := range tests {
+		got := stripModuleIndices(tt.input)
+		if got != tt.want {
+			t.Errorf("stripModuleIndices(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestTopLevelModule(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"", ""},
+		{"module.vpc", "module.vpc"},
+		{"module.vpc.module.sub", "module.vpc"},
+		{`module.foo[0]`, "module.foo"},
+		{`module.foo["key"].module.bar`, "module.foo"},
+	}
+	for _, tt := range tests {
+		got := topLevelModule(tt.input)
+		if got != tt.want {
+			t.Errorf("topLevelModule(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestIsLiteralValue(t *testing.T) {
+	literals := []interface{}{
+		"t2.micro",
+		"us-east-1",
+		"my-bucket-name",
+		"true",
+		float64(443),
+		true,
+		false,
+	}
+	for _, v := range literals {
+		if !isLiteralValue(v) {
+			t.Errorf("isLiteralValue(%v) = false, want true", v)
+		}
+	}
+
+	nonLiterals := []interface{}{
+		"var.instance_type",
+		"module.vpc.vpc_id",
+		"local.common_tags",
+		"data.aws_ami.latest.id",
+		"each.value",
+		"self.id",
+		"terraform.workspace",
+		"aws_lb.main.arn",
+		"azurerm_resource_group.rg.name",
+		"google_compute_instance.vm.id",
+		"null_resource.trigger.id",
+		"random_id.suffix.hex",
+		"tls_private_key.ssh.public_key_openssh",
+		"time_rotating.week.id",
+		"merge({ Env = var.env }, local.tags)",
+		`format("prefix-%s", var.name)`,
+		"[aws_security_group.sg.id]",
+		`{"key": "value"}`,
+		"${var.name}-suffix",
+		"line1\nline2",
+		nil,
+		[]string{"a"},
+		map[string]string{"k": "v"},
+	}
+	for _, v := range nonLiterals {
+		if isLiteralValue(v) {
+			t.Errorf("isLiteralValue(%v) = true, want false", v)
+		}
+	}
+}
+
+func TestCompareWithStateCountModule(t *testing.T) {
+	projectPath := "/test"
+	project := &model.Project{
+		Path: projectPath,
+		Modules: []model.ModuleCall{
+			{
+				Name:     "svc",
+				Source:   "./modules/svc",
+				Location: model.SourceLocation{File: filepath.Join(projectPath, "main.tf")},
+			},
+		},
+		Resources: []model.Resource{
+			{
+				Type:   "aws_ecs_service", Name: "main",
+				Source: model.SourceLocation{File: filepath.Join(projectPath, "modules", "svc", "main.tf")},
+			},
+		},
+		State: &model.StateSnapshot{
+			Resources: []model.StateResource{
+				{
+					Module: "module.svc[0]", Mode: "managed",
+					Type: "aws_ecs_service", Name: "main",
+					Instances: []model.StateResourceInstance{
+						{Attributes: map[string]interface{}{"id": "svc-abc"}},
+					},
+				},
+			},
+		},
+	}
+
+	CompareWithState(project)
+
+	if project.Resources[0].StateStatus != model.StateStatusInSync {
+		t.Errorf("StateStatus = %q, want %q (count module should match after stripping index)", project.Resources[0].StateStatus, model.StateStatusInSync)
+	}
+	if len(project.OrphanedResources) != 0 {
+		t.Errorf("OrphanedResources = %d, want 0", len(project.OrphanedResources))
+	}
+}
+
+func TestCompareWithStateRegistryModuleOrphans(t *testing.T) {
+	project := &model.Project{
+		Path: "/test",
+		Modules: []model.ModuleCall{
+			{Name: "vpc", Source: "terraform-aws-modules/vpc/aws", Location: model.SourceLocation{File: "/test/main.tf"}},
+			{Name: "s3", Source: "./modules/s3", Location: model.SourceLocation{File: "/test/main.tf"}},
+		},
+		Resources: []model.Resource{},
+		State: &model.StateSnapshot{
+			Resources: []model.StateResource{
+				{
+					Module: "module.vpc", Mode: "managed",
+					Type: "aws_vpc", Name: "this",
+					Provider: "provider[\"registry.terraform.io/hashicorp/aws\"]",
+					Instances: []model.StateResourceInstance{
+						{Attributes: map[string]interface{}{"id": "vpc-123"}},
+					},
+				},
+				{
+					Module: "module.vpc", Mode: "managed",
+					Type: "aws_subnet", Name: "private",
+					Provider: "provider[\"registry.terraform.io/hashicorp/aws\"]",
+					Instances: []model.StateResourceInstance{
+						{Attributes: map[string]interface{}{"id": "subnet-456"}},
+					},
+				},
+				{
+					Module: "module.s3", Mode: "managed",
+					Type: "aws_s3_bucket", Name: "real_orphan",
+					Provider: "provider[\"registry.terraform.io/hashicorp/aws\"]",
+					Instances: []model.StateResourceInstance{
+						{Attributes: map[string]interface{}{"id": "orphan-bucket"}},
+					},
+				},
+			},
+		},
+	}
+
+	CompareWithState(project)
+
+	if len(project.OrphanedResources) != 1 {
+		t.Fatalf("OrphanedResources = %d, want 1 (registry module resources should be excluded)", len(project.OrphanedResources))
+	}
+	o := project.OrphanedResources[0]
+	if o.Type != "aws_s3_bucket" || o.Name != "real_orphan" {
+		t.Errorf("Orphan = %s.%s, want aws_s3_bucket.real_orphan", o.Type, o.Name)
+	}
+}
+
+func TestCompareWithStateNoDriftForNewExpressionPatterns(t *testing.T) {
+	project := &model.Project{
+		Path: "/test",
+		Resources: []model.Resource{
+			{
+				Type: "aws_ssm_parameter", Name: "key",
+				Attributes: map[string]interface{}{
+					"name":        `"/app/${var.env}/key"`,
+					"tags":        "merge({ Env = var.env }, local.tags)",
+					"value":       "tls_private_key.ssh.private_key_pem",
+					"description": "literal description",
+				},
+				Source: model.SourceLocation{File: "/test/main.tf"},
+			},
+		},
+		State: &model.StateSnapshot{
+			Resources: []model.StateResource{
+				{
+					Mode: "managed", Type: "aws_ssm_parameter", Name: "key",
+					Instances: []model.StateResourceInstance{
+						{Attributes: map[string]interface{}{
+							"name":        "/app/prod/key",
+							"tags":        map[string]interface{}{"Env": "prod", "terraform": "true"},
+							"value":       "-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
+							"description": "literal description",
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	CompareWithState(project)
+
+	if project.Resources[0].StateStatus != model.StateStatusInSync {
+		t.Errorf("StateStatus = %q, want %q (expression attributes should not trigger drift)", project.Resources[0].StateStatus, model.StateStatusInSync)
 	}
 }

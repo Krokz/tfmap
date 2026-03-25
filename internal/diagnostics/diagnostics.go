@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -134,121 +135,297 @@ func sortDiagnostics(diags []model.Diagnostic) {
 
 // --- Rule 1: dependency-cycle ---
 
-func checkDependencyCycles(project *model.Project) []model.Diagnostic {
-	graph := make(map[string][]string)
-	sourceMap := make(map[string]*model.SourceLocation)
-	// Track raw reference strings: rawRefs["module.a"]["module.b"] = ["module.b.some_output", ...]
-	rawRefs := make(map[string]map[string][]string)
+type entityEntry struct {
+	key  string
+	refs []string
+	src  model.SourceLocation
+}
 
-	addRefs := func(key string, refs []string) {
-		for _, ref := range refs {
-			if target := normalizeRef(ref); target != "" {
-				graph[key] = append(graph[key], target)
-				if rawRefs[key] == nil {
-					rawRefs[key] = make(map[string][]string)
-				}
-				rawRefs[key][target] = append(rawRefs[key][target], ref)
-			}
-		}
+func checkDependencyCycles(project *model.Project) []model.Diagnostic {
+	// In Terraform, each module directory is an isolated scope.
+	// Build a separate dependency graph per directory so that entities
+	// with the same name in different modules don't create false cycles.
+	dirEntities := make(map[string][]entityEntry)
+
+	addEntity := func(key string, refs []string, src model.SourceLocation) {
+		dir := filepath.Dir(src.File)
+		dirEntities[dir] = append(dirEntities[dir], entityEntry{key, refs, src})
 	}
 
 	for i := range project.Resources {
 		r := &project.Resources[i]
-		key := r.Type + "." + r.Name
-		src := r.Source
-		sourceMap[key] = &src
-		addRefs(key, r.References)
+		addEntity(r.Type+"."+r.Name, r.References, r.Source)
 	}
 	for i := range project.DataSources {
 		d := &project.DataSources[i]
-		key := "data." + d.Type + "." + d.Name
-		src := d.Source
-		sourceMap[key] = &src
-		addRefs(key, d.References)
+		addEntity("data."+d.Type+"."+d.Name, d.References, d.Source)
 	}
 	for i := range project.Modules {
 		m := &project.Modules[i]
-		key := "module." + m.Name
-		src := m.Location
-		sourceMap[key] = &src
-		addRefs(key, m.References)
+		addEntity("module."+m.Name, m.References, m.Location)
 	}
 	for i := range project.Outputs {
 		o := &project.Outputs[i]
-		key := "output." + o.Name
-		src := o.Source
-		sourceMap[key] = &src
-		addRefs(key, o.References)
+		addEntity("output."+o.Name, o.References, o.Source)
 	}
 	for i := range project.Locals {
 		l := &project.Locals[i]
-		key := "local." + l.Name
-		src := l.Source
-		sourceMap[key] = &src
-		addRefs(key, l.References)
+		addEntity("local."+l.Name, l.References, l.Source)
 	}
 
-	nodeSet := make(map[string]bool)
-	for k, neighbors := range graph {
-		nodeSet[k] = true
-		for _, n := range neighbors {
-			nodeSet[n] = true
+	// Build module call lookup: dir -> name -> *ModuleCall
+	moduleCallsByDir := make(map[string]map[string]*model.ModuleCall)
+	for i := range project.Modules {
+		m := &project.Modules[i]
+		dir := filepath.Dir(m.Location.File)
+		if moduleCallsByDir[dir] == nil {
+			moduleCallsByDir[dir] = make(map[string]*model.ModuleCall)
 		}
+		moduleCallsByDir[dir][m.Name] = m
 	}
-
-	cycles := detectCycles(graph, nodeSet)
 
 	var diags []model.Diagnostic
-	for _, cycle := range cycles {
-		entity := cycle[0]
 
-		var detail strings.Builder
-		var cycleEdges []model.CycleEdge
-		for i := 0; i < len(cycle)-1; i++ {
-			from := cycle[i]
-			to := cycle[i+1]
-			if i > 0 {
-				detail.WriteString("\n")
-			}
-			loc := ""
-			src := sourceMap[from]
-			if src != nil {
-				loc = fmt.Sprintf(" (%s:%d)", src.File, src.Line)
-			}
+	for dir, entities := range dirEntities {
+		graph := make(map[string][]string)
+		sourceMap := make(map[string]*model.SourceLocation)
+		rawRefs := make(map[string]map[string][]string)
 
-			// Collect the raw references that create this edge
-			refs := rawRefs[from][to]
-			refStr := ""
-			if len(refs) > 0 {
-				refStr = strings.Join(refs, ", ")
-				detail.WriteString(fmt.Sprintf("%s%s -> %s (via %s)", from, loc, to, refStr))
-			} else {
-				detail.WriteString(fmt.Sprintf("%s%s -> %s", from, loc, to))
+		for _, e := range entities {
+			src := e.src
+			sourceMap[e.key] = &src
+			for _, ref := range e.refs {
+				if target := normalizeRef(ref); target != "" {
+					graph[e.key] = append(graph[e.key], target)
+					if rawRefs[e.key] == nil {
+						rawRefs[e.key] = make(map[string][]string)
+					}
+					rawRefs[e.key][target] = append(rawRefs[e.key][target], ref)
+				}
 			}
-
-			edge := model.CycleEdge{
-				From:     from,
-				To:       to,
-				Source:   src,
-				ViaRefs:  refs,
-			}
-			if src != nil {
-				edge.Snippet = extractSnippetWithRefs(project.Path, src, to, refs)
-			}
-			cycleEdges = append(cycleEdges, edge)
 		}
 
-		diags = append(diags, model.Diagnostic{
-			Severity:   model.DiagError,
-			Rule:       "dependency-cycle",
-			Message:    fmt.Sprintf("Dependency cycle detected (%d entities)", len(cycle)-1),
-			Detail:     detail.String(),
-			Source:     sourceMap[entity],
-			Entity:     entity,
-			CycleEdges: cycleEdges,
-		})
+		nodeSet := make(map[string]bool)
+		for k, neighbors := range graph {
+			nodeSet[k] = true
+			for _, n := range neighbors {
+				nodeSet[n] = true
+			}
+		}
+
+		cycles := detectCycles(graph, nodeSet)
+
+		for _, cycle := range cycles {
+			if isModuleOnlyCycle(cycle) &&
+				!verifyModuleCycle(cycle, rawRefs, dir, moduleCallsByDir, dirEntities) {
+				continue
+			}
+
+			entity := cycle[0]
+
+			var detail strings.Builder
+			var cycleEdges []model.CycleEdge
+			for i := 0; i < len(cycle)-1; i++ {
+				from := cycle[i]
+				to := cycle[i+1]
+				if i > 0 {
+					detail.WriteString("\n")
+				}
+				loc := ""
+				src := sourceMap[from]
+				if src != nil {
+					loc = fmt.Sprintf(" (%s:%d)", src.File, src.Line)
+				}
+
+				refs := rawRefs[from][to]
+				refStr := ""
+				if len(refs) > 0 {
+					refStr = strings.Join(refs, ", ")
+					detail.WriteString(fmt.Sprintf("%s%s -> %s (via %s)", from, loc, to, refStr))
+				} else {
+					detail.WriteString(fmt.Sprintf("%s%s -> %s", from, loc, to))
+				}
+
+				edge := model.CycleEdge{
+					From:    from,
+					To:      to,
+					Source:  src,
+					ViaRefs: refs,
+				}
+				if src != nil {
+					edge.Snippet = extractSnippetWithRefs(project.Path, src, to, refs)
+				}
+				cycleEdges = append(cycleEdges, edge)
+			}
+
+			diags = append(diags, model.Diagnostic{
+				Severity:   model.DiagError,
+				Rule:       "dependency-cycle",
+				Message:    fmt.Sprintf("Dependency cycle detected (%d entities)", len(cycle)-1),
+				Detail:     detail.String(),
+				Source:     sourceMap[entity],
+				Entity:     entity,
+				CycleEdges: cycleEdges,
+			})
+		}
 	}
 	return diags
+}
+
+func isModuleOnlyCycle(cycle []string) bool {
+	for i := 0; i < len(cycle)-1; i++ {
+		if !strings.HasPrefix(cycle[i], "module.") {
+			return false
+		}
+	}
+	return true
+}
+
+func isLocalModuleSource(source string) bool {
+	return strings.HasPrefix(source, "./") || strings.HasPrefix(source, "../")
+}
+
+// verifyModuleCycle checks whether a cycle consisting entirely of module.*
+// nodes is a real cycle by tracing through each module's internal dependency
+// graph. Terraform resolves dependencies at the individual resource/output
+// level inside modules, so a module-level cycle is only real if each
+// referenced output transitively depends on the variable that creates the
+// return edge. Returns false if any edge is proven to be a false positive.
+func verifyModuleCycle(
+	cycle []string,
+	rawRefs map[string]map[string][]string,
+	dir string,
+	moduleCallsByDir map[string]map[string]*model.ModuleCall,
+	dirEntities map[string][]entityEntry,
+) bool {
+	ring := cycle[:len(cycle)-1]
+	ringLen := len(ring)
+
+	for j := 0; j < ringLen; j++ {
+		fromNode := ring[j]
+		targetNode := ring[(j+1)%ringLen]
+		targetName := strings.TrimPrefix(targetNode, "module.")
+
+		dirModules := moduleCallsByDir[dir]
+		if dirModules == nil {
+			continue
+		}
+		targetCall := dirModules[targetName]
+		if targetCall == nil {
+			continue
+		}
+
+		if !isLocalModuleSource(targetCall.Source) {
+			if fromNode == targetNode {
+				return false
+			}
+			continue
+		}
+
+		targetDir := filepath.Clean(filepath.Join(dir, targetCall.Source))
+
+		targetEntities := dirEntities[targetDir]
+		if len(targetEntities) == 0 {
+			continue
+		}
+
+		incomingOutputs := extractModuleOutputNames(rawRefs[fromNode][targetNode])
+		if len(incomingOutputs) == 0 {
+			continue
+		}
+
+		nextNode := ring[(j+2)%ringLen]
+		nextName := strings.TrimPrefix(nextNode, "module.")
+
+		var cyclingVars []string
+		searchStr := "module." + nextName + "."
+		for attrName, attrVal := range targetCall.Inputs {
+			if strings.Contains(fmt.Sprintf("%v", attrVal), searchStr) {
+				cyclingVars = append(cyclingVars, "var."+attrName)
+			}
+		}
+
+		if len(cyclingVars) == 0 {
+			continue
+		}
+
+		edgeReal := false
+		for _, outputName := range incomingOutputs {
+			reachable := transitiveVarDeps("output."+outputName, targetEntities)
+			for _, v := range cyclingVars {
+				if reachable[v] {
+					edgeReal = true
+					break
+				}
+			}
+			if edgeReal {
+				break
+			}
+		}
+
+		if !edgeReal {
+			return false
+		}
+	}
+
+	return true
+}
+
+// extractModuleOutputNames extracts output names from raw reference strings
+// like "module.foo.output_name".
+func extractModuleOutputNames(refs []string) []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, ref := range refs {
+		parts := strings.SplitN(ref, ".", 3)
+		if len(parts) >= 3 && parts[0] == "module" {
+			if !seen[parts[2]] {
+				seen[parts[2]] = true
+				names = append(names, parts[2])
+			}
+		}
+	}
+	return names
+}
+
+// transitiveVarDeps does a BFS from startKey through the entities in a
+// directory, following normalized references, and returns all var.* names
+// reachable from the starting entity.
+func transitiveVarDeps(startKey string, entities []entityEntry) map[string]bool {
+	entityRefs := make(map[string][]string)
+	for _, e := range entities {
+		entityRefs[e.key] = e.refs
+	}
+
+	vars := make(map[string]bool)
+	visited := make(map[string]bool)
+	queue := []string{startKey}
+
+	for len(queue) > 0 {
+		key := queue[0]
+		queue = queue[1:]
+		if visited[key] {
+			continue
+		}
+		visited[key] = true
+
+		for _, ref := range entityRefs[key] {
+			parts := strings.SplitN(ref, ".", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			if parts[0] == "var" {
+				vars["var."+parts[1]] = true
+				continue
+			}
+			target := normalizeRef(ref)
+			if target != "" && !visited[target] {
+				queue = append(queue, target)
+			}
+		}
+	}
+
+	return vars
 }
 
 // extractSnippetWithRefs reads the source file and returns lines around the entity definition,
