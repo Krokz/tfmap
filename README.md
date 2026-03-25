@@ -39,6 +39,8 @@ make build
 make run DIR=/path/to/terraform/project
 ```
 
+The frontend is embedded into the binary at compile time via `go:embed`, so the resulting `tfmap` binary is fully self-contained — copy it anywhere and it works.
+
 When run without a path argument, tfmap opens a native OS folder picker dialog so you can browse to your Terraform project directory.
 
 The UI opens automatically at `http://127.0.0.1:<port>` (a random available port is chosen by default).
@@ -109,8 +111,10 @@ tfmap/
 │   └── src/
 │       ├── components/           # TreeExplorer, GraphView, DetailPanel, etc.
 │       ├── hooks/                # useProject (WebSocket + fetch)
+│       ├── utils/                # Shared utilities (module resolution, etc.)
 │       └── types.ts              # TypeScript types mirroring Go model
-├── main.go
+├── main.go                       # Entrypoint, passes embedded FS to CLI
+├── embed.go                      # go:embed directive for web/dist
 ├── Makefile
 └── README.md
 ```
@@ -142,13 +146,16 @@ make test-verbose
 go test ./internal/diagnostics/ -v
 ```
 
+> **Note:** Use `make test` rather than `go test ./...` directly — the Makefile ensures `web/dist` exists, which is required by the `go:embed` directive in the root package.
+
 ### Linting
 
 ```bash
-# Go
-go vet ./...
+# Run all linters
+make lint
 
-# Frontend
+# Or individually
+go vet ./...
 cd web && npm run lint
 ```
 
@@ -178,6 +185,8 @@ cd web && npm run lint
 ```
 
 **Data flow:** Parser reads `.tf` files → builds a `Project` model → state reader enriches with drift info → diagnostics engine analyzes → server serves over HTTP/WS → React app renders the graph, tree, and diagnostic panels. The filesystem watcher re-triggers the pipeline on changes.
+
+The React SPA is embedded into the Go binary at build time (`go:embed`), so the server serves it directly from memory. During development, the server falls back to the `web/dist` directory on disk, allowing the Vite dev server to handle frontend hot-reload via proxy.
 
 ## License
 
