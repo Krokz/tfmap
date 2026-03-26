@@ -200,6 +200,10 @@ cd web && npm run lint
 
 The React SPA is embedded into the Go binary at build time (`go:embed`), so the server serves it directly from memory. During development, the server falls back to the `web/dist` directory on disk, allowing the Vite dev server to handle frontend hot-reload via proxy.
 
+## See also
+
+- [InfraMap](https://github.com/cycloidio/inframap) — generates static infrastructure diagrams from Terraform state/HCL with provider-aware filtering. A good fit if you want exportable SVG/DOT diagrams rather than an interactive browser UI.
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
