@@ -25,6 +25,7 @@ import (
 var (
 	port       int
 	noBrowser  bool
+	browserTab bool
 	noState    bool
 	awsProfile string
 )
@@ -42,7 +43,8 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.Flags().IntVarP(&port, "port", "p", 0, "port to serve the UI on (default: random available port)")
-	rootCmd.Flags().BoolVar(&noBrowser, "no-browser", false, "don't open the browser automatically")
+	rootCmd.Flags().BoolVar(&noBrowser, "no-browser", false, "don't open the UI automatically")
+	rootCmd.Flags().BoolVar(&browserTab, "browser", false, "open the UI in a regular browser tab instead of a dedicated app window")
 	rootCmd.Flags().BoolVar(&noState, "no-state", false, "skip state reading entirely")
 	rootCmd.Flags().StringVar(&awsProfile, "aws-profile", "", "AWS profile to use for S3 state reading")
 }
@@ -135,11 +137,28 @@ func run(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\ntfmap serving at %s\n", url)
 	fmt.Printf("Watching: %s\n", absPath)
 
-	if !noBrowser {
+	if noBrowser {
+		return srv.Serve(listener)
+	}
+	if browserTab {
 		openBrowser(url)
+		return srv.Serve(listener)
 	}
 
-	return srv.Serve(listener)
+	// Dedicated window: serve in the background and block on the native
+	// webview window; closing the window quits tfmap.
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(listener) }()
+
+	title := fmt.Sprintf("tfmap — %s", filepath.Base(absPath))
+	if err := runNativeWindow(url, title); err != nil {
+		log.Printf("Native window unavailable (%v), falling back to browser", err)
+		openWindow(url)
+		return <-serveErr
+	}
+
+	fmt.Println("Window closed — shutting down.")
+	return nil
 }
 
 type backendChoice struct {

@@ -18,7 +18,7 @@ A local-first Terraform visualization tool. Point it at any Terraform directory 
 
 | Tool | Version |
 |------|---------|
-| Go | 1.25+ |
+| Go | 1.26+ |
 | Node.js | 20+ (see `web/.nvmrc`) |
 | npm | 10+ |
 | AWS CLI | optional, for S3 state reading |
@@ -45,7 +45,7 @@ The frontend is embedded into the binary at compile time via `go:embed`, so the 
 
 When run without a path argument, tfmap opens a native OS folder picker dialog so you can browse to your Terraform project directory.
 
-The UI opens automatically at `http://127.0.0.1:<port>` (a random available port is chosen by default).
+The UI opens in a native tfmap window using the OS's built-in webview (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux) — closing the window quits tfmap. If the native webview isn't available (e.g. WebKitGTK not installed on Linux), tfmap falls back to a Chromium app-mode window, then to a regular tab in your default browser; in fallback mode the server keeps running until Ctrl-C. The server listens at `http://127.0.0.1:<port>` (a random available port is chosen by default). Pass `--browser` if you prefer a regular browser tab.
 
 ### Cross-compilation
 
@@ -78,7 +78,8 @@ make build-windows-amd64
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--port` | `-p` | `0` (random) | Port to serve the UI on |
-| `--no-browser` | | `false` | Don't open the browser automatically |
+| `--no-browser` | | `false` | Don't open the UI automatically |
+| `--browser` | | `false` | Open the UI in a regular browser tab instead of a dedicated app window |
 | `--no-state` | | `false` | Skip state reading entirely |
 | `--aws-profile` | | | AWS profile for S3 state reading |
 

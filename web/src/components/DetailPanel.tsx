@@ -1,4 +1,5 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef } from "react";
+import type { ReactNode } from "react";
 import type { Project, ModuleCall, StateStatus, CycleEdge } from "../types";
 import type { SelectedItem, CycleHighlightSet } from "../App";
 import { resolveModuleCallToPath } from "../utils/module";
@@ -57,6 +58,59 @@ const KIND_COLORS: Record<SelectedItem["kind"], string> = {
   local: "bg-pink-500/20 text-pink-300",
   provider: "bg-blue-500/20 text-blue-300",
 };
+
+const HEIGHT_STORAGE_KEY = "tfmap-detail-panel-height";
+const DEFAULT_HEIGHT = 288;
+const MIN_HEIGHT = 120;
+
+function clampHeight(h: number): number {
+  const max = Math.round(window.innerHeight * 0.8);
+  return Math.min(Math.max(h, MIN_HEIGHT), max);
+}
+
+function ResizablePanel({ children }: { children: ReactNode }) {
+  const [height, setHeight] = useState(() => {
+    const stored = Number(localStorage.getItem(HEIGHT_STORAGE_KEY));
+    return stored > 0 ? clampHeight(stored) : DEFAULT_HEIGHT;
+  });
+  const drag = useRef<{ startY: number; startHeight: number } | null>(null);
+
+  return (
+    <div
+      style={{ height }}
+      className="relative border-t border-gray-800 bg-gray-900 shrink-0 flex flex-col"
+    >
+      <div
+        onPointerDown={(e) => {
+          e.preventDefault();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          drag.current = { startY: e.clientY, startHeight: height };
+        }}
+        onPointerMove={(e) => {
+          if (!drag.current) return;
+          setHeight(
+            clampHeight(drag.current.startHeight + (drag.current.startY - e.clientY))
+          );
+        }}
+        onPointerUp={(e) => {
+          if (!drag.current) return;
+          drag.current = null;
+          e.currentTarget.releasePointerCapture(e.pointerId);
+          localStorage.setItem(HEIGHT_STORAGE_KEY, String(height));
+        }}
+        onDoubleClick={() => {
+          setHeight(DEFAULT_HEIGHT);
+          localStorage.setItem(HEIGHT_STORAGE_KEY, String(DEFAULT_HEIGHT));
+        }}
+        className="absolute inset-x-0 -top-1 h-2 cursor-row-resize touch-none z-20 group"
+        title="Drag to resize · double-click to reset"
+      >
+        <div className="mx-auto mt-[3px] h-1 w-12 rounded-full bg-gray-600 opacity-0 group-hover:opacity-100 transition-opacity" />
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto">{children}</div>
+    </div>
+  );
+}
 
 interface ItemInfo {
   label: string;
@@ -657,8 +711,8 @@ export function DetailPanel({ project, fullProject, selected, onClose, onNavigat
 
   if (!item) {
     return (
-      <div className="h-64 border-t border-gray-800 bg-gray-900 overflow-y-auto shrink-0 p-4">
-        <div className="flex justify-between items-center">
+      <ResizablePanel>
+        <div className="p-4 flex justify-between items-center">
           <span className="text-sm text-gray-500">
             Item not found: {selected.id}
           </span>
@@ -681,7 +735,7 @@ export function DetailPanel({ project, fullProject, selected, onClose, onNavigat
             </svg>
           </button>
         </div>
-      </div>
+      </ResizablePanel>
     );
   }
 
@@ -690,7 +744,7 @@ export function DetailPanel({ project, fullProject, selected, onClose, onNavigat
   );
 
   return (
-    <div className="h-72 border-t border-gray-800 bg-gray-900 overflow-y-auto shrink-0">
+    <ResizablePanel>
       <div className="sticky top-0 bg-gray-900 border-b border-gray-800 px-4 py-2.5 flex items-center justify-between z-10">
         <div className="flex items-center gap-3">
           <span
@@ -831,6 +885,6 @@ export function DetailPanel({ project, fullProject, selected, onClose, onNavigat
           </div>
         )}
       </div>
-    </div>
+    </ResizablePanel>
   );
 }
